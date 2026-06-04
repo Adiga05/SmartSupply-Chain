@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   AreaChart,
   Area,
@@ -348,34 +348,64 @@ export default function IotDashboard() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
         @keyframes spin { to { transform: rotate(360deg); } }
+        .glass-header {
+          background: rgba(255, 255, 255, 0.65);
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          border: 1px solid rgba(255, 255, 255, 1);
+          border-radius: 28px;
+          padding: 2rem 2.5rem;
+          box-shadow: 0 12px 36px rgba(15, 23, 42, 0.03), inset 0 1px 0 rgba(255,255,255,1);
+        }
+        .refresh-btn {
+          background: #c7d2fe;
+          color: #312e81;
+          border: 2px solid #ffffff;
+          border-radius: 999px;
+          padding: 0.85rem 1.75rem;
+          font-weight: 700;
+          font-family: inherit;
+          font-size: 1rem;
+          cursor: pointer;
+          box-shadow: 0 8px 20px rgba(199, 210, 254, 0.6);
+          transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+        }
+        .refresh-btn:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 12px 25px rgba(199, 210, 254, 0.8);
+          background: #a5b4fc;
+        }
+        .refresh-btn:active {
+          transform: translateY(1px);
+        }
       `}</style>
 
       {!dismissed && anomalies.length > 0 && <AnomalyBanner anomalies={anomalies} onDismiss={() => setDismissed(true)} />}
 
-      <header style={{
+      <header className="glass-header" style={{
         maxWidth: 1360,
         margin: "0 auto 1.5rem",
         display: "flex",
         flexWrap: "wrap",
         alignItems: "center",
         justifyContent: "space-between",
-        gap: "1rem",
+        gap: "1.5rem",
       }}>
         <div>
-          <p style={{ margin: 0, fontSize: 12, letterSpacing: "0.24em", color: "#475569", textTransform: "uppercase" }}>Supply Chain IoT</p>
-          <h1 style={{ margin: "0.35rem 0 0", fontSize: 32, lineHeight: 1.05, color: "#0f172a" }}>Asset Monitoring Dashboard</h1>
-          <p style={{ margin: "0.75rem 0 0", color: "#475569", maxWidth: 600 }}>Direct ThingSpeak integration with fresh telemetry, friendly visuals, and clean metrics for your supply chain assets.</p>
+          <p style={{ margin: 0, fontSize: 13, letterSpacing: "0.25em", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>Supply Chain IoT</p>
+          <h1 style={{ margin: "0.5rem 0 0", fontSize: 36, lineHeight: 1.1, color: "#0f172a", letterSpacing: "-0.03em" }}>Asset Monitoring Dashboard</h1>
+          <p style={{ margin: "0.85rem 0 0", color: "#475569", maxWidth: 650, fontSize: "1.05rem", lineHeight: 1.6 }}>Direct ThingSpeak integration with fresh telemetry, friendly visuals, and clean metrics for your supply chain assets.</p>
         </div>
-        <button onClick={refetch} style={{
-          background: "linear-gradient(135deg, #84CCFF 0%, #FFB4CF 55%, #7ABE80 100%)",
-          color: "#0f172a",
-          border: "none",
-          borderRadius: 999,
-          padding: "0.85rem 1.35rem",
-          fontWeight: 700,
-          cursor: "pointer",
-          boxShadow: "0 24px 50px rgba(132,204,255,0.24)",
-        }}>Refresh Now</button>
+        <button onClick={refetch} className="refresh-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+            <path d="M3 3v5h5"/>
+          </svg>
+          Refresh Now
+        </button>
       </header>
 
       <main style={{
