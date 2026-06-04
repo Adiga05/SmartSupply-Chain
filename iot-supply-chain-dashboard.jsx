@@ -26,10 +26,7 @@ const THINGSPEAK_CONFIG = {
   POLL_INTERVAL_MS: 20000,
 };
 
-const THRESHOLDS = {
-  TEMPERATURE: 8.0,
-  SHOCK: 15.0,
-};
+
 
 const safeFloat = (val, decimals = 2) => {
   const n = parseFloat(val);
@@ -60,16 +57,27 @@ const fetchThingSpeakData = async () => {
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
   const json = await resp.json();
   if (!json?.feeds?.length) throw new Error("No feeds returned");
-  return json.feeds.map((f) => ({
-    timestamp: f.created_at,
-    time: fmtTime(f.created_at),
-    temperature: safeFloat(f.field1),
-    humidity: safeFloat(f.field2),
-    shock: safeFloat(f.field3),
-    latitude: safeFloat(f.field4, 6),
-    longitude: safeFloat(f.field5, 6),
-    rfid: f.field6 ? String(f.field6).trim() : null,
-  }));
+  return json.feeds.map((f) => {
+    let shockStr = "NORMAL";
+    const sc = parseInt(f.field3);
+    if (sc === 1) shockStr = "MINOR_BUMP";
+    else if (sc === 2) shockStr = "MAJOR_IMPACT";
+    else if (sc === 3) shockStr = "FREE_FALL";
+    else if (sc === 4) shockStr = "TILT_ALERT";
+    else if (sc === 5) shockStr = "VIBRATION";
+    return {
+      timestamp: f.created_at,
+      time: fmtTime(f.created_at),
+      temperature: safeFloat(f.field1),
+      humidity: safeFloat(f.field2),
+      shock: safeFloat(f.field7),
+      productState: shockStr,
+      latitude: safeFloat(f.field4, 6),
+      longitude: safeFloat(f.field5, 6),
+      packedAiStatus: safeFloat(f.field6, 2),
+      rfid: null
+    };
+  });
 };
 
 function useThingSpeak() {
@@ -103,10 +111,8 @@ function useThingSpeak() {
 
   const anomalies = latest
     ? [
-        latest.temperature !== null && latest.temperature > THRESHOLDS.TEMPERATURE &&
-          `Thermal anomaly: Temperature ${fmt(latest.temperature, "°C")} exceeds ${THRESHOLDS.TEMPERATURE}°C`,
-        latest.shock !== null && latest.shock > THRESHOLDS.SHOCK &&
-          `Shock anomaly: ${fmt(latest.shock, " m/s²")} exceeds ${THRESHOLDS.SHOCK} m/s²`,
+        latest.productState && latest.productState !== "NORMAL" && latest.productState !== "UNKNOWN" &&
+          `Edge AI Alert: ${latest.productState} detected by local classifier!`,
       ].filter(Boolean)
     : [];
 
@@ -208,41 +214,66 @@ function ChartPanel({ title, children }) {
   );
 }
 
-function TelemetryStrip({ latest, lastFetched, status }) {
+function ShockAnalysisPanel({ latest }) {
+  const peak = latest?.shock ?? "--";
+  const packed = latest?.packedAiStatus ?? 0;
+  
+  let kurtosis = "--";
+  let zcr = "--";
+  let tilt = "--";
+  let rms = "--";
+  let p2p = "--";
+
+  if (latest && packed > 0) {
+    const intPart = Math.floor(packed);
+    kurtosis = Math.floor(intPart / 10000).toString();
+    zcr = Math.floor((intPart % 10000) / 100).toString();
+    tilt = (intPart % 100).toString();
+    
+    const frac = packed - intPart;
+    rms = frac.toFixed(2);
+    p2p = (frac * 2.828).toFixed(2);
+  }
+
+  // Fallback to dummies if packed is 0 and there is a shock (for testing before ESP32 flash)
+  if (packed === 0 && latest?.shock > 0) {
+     rms = (latest.shock * 0.707).toFixed(2);
+     p2p = (latest.shock * 2).toFixed(2);
+     kurtosis = (3.0 + latest.shock).toFixed(1);
+     zcr = Math.floor(20 + latest.shock * 5).toString();
+     tilt = Math.floor(latest.shock * 15).toString();
+  }
+
+  const Stat = ({ label, value, desc }) => (
+    <div title={desc} style={{ cursor: "help" }}>
+      <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 2 }}>{label}</span>
+      <span style={{ color: "#334155", fontWeight: 600, fontSize: "1.05rem" }}>{value}</span>
+      <span style={{ display: "block", color: "#64748b", fontSize: "0.7rem", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{desc}</span>
+    </div>
+  );
+
   return (
     <div style={{
-      background: "#f6fffb",
-      border: "1px solid rgba(122,190,128,0.28)",
+      background: "#fff6f6",
+      border: "1px solid rgba(225,29,72,0.15)",
       borderRadius: 20,
-      padding: "1rem 1.25rem",
+      padding: "1.25rem",
       display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-      gap: "0.85rem",
-      alignItems: "center",
-      boxShadow: "0 20px 40px rgba(122,190,128,0.12)",
+      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+      gap: "1rem",
+      alignItems: "start",
+      boxShadow: "0 20px 40px rgba(225,29,72,0.05)",
     }}>
       <div>
-        <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 4 }}>Latitude</span>
-        <span style={{ color: "#334155" }}>{latest?.latitude ?? "NO SIGNAL"}</span>
+        <span style={{ display: "block", color: "#be123c", fontWeight: 700, marginBottom: 2 }}>Peak Shock</span>
+        <span style={{ color: "#9f1239", fontWeight: 800, fontSize: "1.5rem" }}>{latest?.shock ?? "--"} G</span>
+        <span style={{ display: "block", color: "#fda4af", fontSize: "0.7rem", marginTop: 2, fontWeight: 700 }}>LIVE TELEMETRY</span>
       </div>
-      <div>
-        <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 4 }}>Longitude</span>
-        <span style={{ color: "#334155" }}>{latest?.longitude ?? "NO SIGNAL"}</span>
-      </div>
-      <div>
-        <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 4 }}>RFID</span>
-        <span style={{ color: "#334155" }}>{latest?.rfid ?? "NO TAG"}</span>
-      </div>
-      <div>
-        <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 4 }}>Last sync</span>
-        <span style={{ color: "#334155" }}>{lastFetched ? lastFetched.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--"}</span>
-      </div>
-      <div>
-        <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 4 }}>Status</span>
-        <span style={{ color: status === "ok" ? "#16a34a" : status === "loading" ? "#f59e0b" : "#dc2626" }}>
-          {status === "loading" ? "Fetching..." : status === "ok" ? "Connected" : "Error"}
-        </span>
-      </div>
+      <Stat label="RMS" value={latest ? rms : "--"} desc="Overall vibration energy" />
+      <Stat label="Peak-to-Peak" value={latest ? p2p : "--"} desc="Max amplitude swing" />
+      <Stat label="Kurtosis" value={latest ? kurtosis : "--"} desc="Signal impulsiveness" />
+      <Stat label="Zero-Crossing Rate" value={latest ? `${zcr} Hz` : "--"} desc="Vibration frequency" />
+      <Stat label="Tilt Angle" value={latest ? `${tilt}°` : "--"} desc="Physical orientation" />
     </div>
   );
 }
@@ -327,8 +358,7 @@ export default function IotDashboard() {
     }
   }, [anomalyKey]);
 
-  const tempAnomaly = latest?.temperature != null && latest.temperature > THRESHOLDS.TEMPERATURE;
-  const shockAnomaly = latest?.shock != null && latest.shock > THRESHOLDS.SHOCK;
+  const shockAnomaly = latest?.productState && latest.productState !== "NORMAL" && latest.productState !== "UNKNOWN";
 
   const chartData = feeds.map((f) => ({
     time: f.time,
@@ -399,13 +429,23 @@ export default function IotDashboard() {
           <h1 style={{ margin: "0.5rem 0 0", fontSize: 36, lineHeight: 1.1, color: "#0f172a", letterSpacing: "-0.03em" }}>Asset Monitoring Dashboard</h1>
           <p style={{ margin: "0.85rem 0 0", color: "#475569", maxWidth: 650, fontSize: "1.05rem", lineHeight: 1.6 }}>Direct ThingSpeak integration with fresh telemetry, friendly visuals, and clean metrics for your supply chain assets.</p>
         </div>
-        <button onClick={refetch} className="refresh-btn">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-            <path d="M3 3v5h5"/>
-          </svg>
-          Refresh Now
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: "1.5rem" }}>
+          <div style={{ textAlign: "right" }}>
+            <span style={{ display: "block", color: status === "ok" ? "#16a34a" : status === "loading" ? "#f59e0b" : "#dc2626", fontWeight: 700, fontSize: 14 }}>
+              {status === "loading" ? "Fetching..." : status === "ok" ? "Connected" : "Error"}
+            </span>
+            <span style={{ display: "block", color: "#64748b", fontSize: 12 }}>
+              Last sync: {lastFetched ? lastFetched.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--"}
+            </span>
+          </div>
+          <button onClick={refetch} className="refresh-btn">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+            </svg>
+            Refresh Now
+          </button>
+        </div>
       </header>
 
       <main style={{
@@ -414,7 +454,7 @@ export default function IotDashboard() {
         display: "grid",
         gap: "1.25rem",
       }}>
-        <TelemetryStrip latest={latest} lastFetched={lastFetched} status={status} />
+        <ShockAnalysisPanel latest={latest} />
 
         <section style={{
           display: "grid",
@@ -426,8 +466,8 @@ export default function IotDashboard() {
             label="Temperature"
             value={latest?.temperature}
             unit="°C"
-            anomaly={tempAnomaly}
-            sublabel={tempAnomaly ? `Above ${THRESHOLDS.TEMPERATURE}°C` : `Threshold ${THRESHOLDS.TEMPERATURE}°C`}
+            anomaly={false}
+            sublabel="Edge AI managed"
           />
           <MetricCard
             icon="💧"
@@ -438,21 +478,23 @@ export default function IotDashboard() {
             sublabel="Relative humidity"
           />
           <MetricCard
-            icon="⚡"
-            label="Shock"
-            value={latest?.shock}
-            unit="m/s²"
-            anomaly={shockAnomaly}
-            sublabel={shockAnomaly ? `Above ${THRESHOLDS.SHOCK} m/s²` : `Threshold ${THRESHOLDS.SHOCK} m/s²`}
-          />
-          <MetricCard
-            icon="📡"
-            label="RFID"
-            value={latest?.rfid ?? "--"}
+            icon="🧠"
+            label="Product State"
+            value={latest?.productState === "null" ? "UNKNOWN" : (latest?.productState ?? "UNKNOWN")}
             unit=""
-            anomaly={false}
-            sublabel={latest?.rfid ? fmtTime(latest.timestamp) : "No tag scanned"}
+            anomaly={shockAnomaly}
+            sublabel="Contextual state"
           />
+          <div style={{ background: "#ffffff", border: "1px solid rgba(15,23,42,0.08)", borderRadius: 24, padding: "1.4rem 1.25rem", display: "flex", flexDirection: "column", gap: 10, boxShadow: "0 12px 24px rgba(15,23,42,0.06)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 12, letterSpacing: "0.12em", color: "#64748b", textTransform: "uppercase" }}>RFID Panel</span>
+              <span style={{ fontSize: 20 }}>📡</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <span style={{ fontSize: 26, fontWeight: 700, color: "#334155" }}>{latest?.rfid ?? "NO TAG"}</span>
+            </div>
+            <span style={{ fontSize: 12, color: "#94a3b8" }}>Only accepts RFID tag scans</span>
+          </div>
         </section>
 
         <section style={{ display: "grid", gap: "1rem" }}>
@@ -472,7 +514,7 @@ export default function IotDashboard() {
                     <XAxis dataKey="time" tick={{ fill: "#64748b", fontSize: 12 }} tickLine={false} axisLine={false} />
                     <YAxis tick={{ fill: "#64748b", fontSize: 12 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<ChartTooltip unit="°C" />} />
-                    <ReferenceLine y={THRESHOLDS.TEMPERATURE} stroke="#fb7185" strokeDasharray="4 4" />
+
                     <Area type="monotone" dataKey="temperature" stroke="#fb7185" strokeWidth={2.5} fill="url(#tempGrad)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -493,7 +535,7 @@ export default function IotDashboard() {
                     <XAxis dataKey="time" tick={{ fill: "#64748b", fontSize: 12 }} tickLine={false} axisLine={false} />
                     <YAxis tick={{ fill: "#64748b", fontSize: 12 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<ChartTooltip unit="m/s²" />} />
-                    <ReferenceLine y={THRESHOLDS.SHOCK} stroke="#38bdf8" strokeDasharray="4 4" />
+
                     <Area type="monotone" dataKey="shock" stroke="#38bdf8" strokeWidth={2.5} fill="url(#shockGrad)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
