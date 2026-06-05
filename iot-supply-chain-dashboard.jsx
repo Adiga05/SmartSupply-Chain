@@ -65,6 +65,25 @@ const fetchThingSpeakData = async () => {
     else if (sc === 3) shockStr = "FREE_FALL";
     else if (sc === 4) shockStr = "TILT_ALERT";
     else if (sc === 5) shockStr = "VIBRATION";
+
+    const packed = parseFloat(f.field6) || 0;
+    const intPacked = Math.floor(packed);
+    const ss = Math.floor(intPacked / 10000);
+    const tempAnom = Math.floor((intPacked % 100) / 10) === 1;
+    const humAnom = (intPacked % 10) === 1;
+
+    let transportState = "UNKNOWN";
+    if (ss === 0) transportState = "STATIONARY";
+    else if (ss === 1) transportState = "IN_TRANSIT";
+    else if (ss === 2) transportState = "IMPACT_EVENT";
+    else if (ss === 3) transportState = "LOADING";
+    else if (ss === 4) transportState = "ENV_ALERT";
+
+    // Extract Priority and RFID from ThingSpeak status string
+    const statusParts = (f.status || "").split("|");
+    const priority = statusParts.length >= 3 ? statusParts[2] : "NORMAL";
+    const rfidValue = statusParts.length >= 4 ? statusParts[3] : "0";
+
     return {
       timestamp: f.created_at,
       time: fmtTime(f.created_at),
@@ -74,8 +93,13 @@ const fetchThingSpeakData = async () => {
       productState: shockStr,
       latitude: safeFloat(f.field4, 6),
       longitude: safeFloat(f.field5, 6),
-      packedAiStatus: safeFloat(f.field6, 2),
-      rfid: null
+      packedAiStatus: packed,
+      transportState,
+      tempAnomaly: tempAnom,
+      humAnomaly: humAnom,
+      anomalyScore: safeFloat(f.field8, 2),
+      priority,
+      rfid: (rfidValue === "0" || rfidValue === "") ? "NO TAG" : rfidValue
     };
   });
 };
@@ -111,8 +135,10 @@ function useThingSpeak() {
 
   const anomalies = latest
     ? [
-        latest.productState && latest.productState !== "NORMAL" && latest.productState !== "UNKNOWN" &&
-          `Edge AI Alert: ${latest.productState} detected by local classifier!`,
+        (latest.productState === "MAJOR_IMPACT" || latest.productState === "FREE_FALL") &&
+          `Impact Alert: ${latest.productState} detected!`,
+        latest.tempAnomaly && `Temperature Anomaly Detected! Score: ${latest.anomalyScore}`,
+        latest.humAnomaly && `Humidity Anomaly Detected! Score: ${latest.anomalyScore}`
       ].filter(Boolean)
     : [];
 
@@ -214,36 +240,7 @@ function ChartPanel({ title, children }) {
   );
 }
 
-function ShockAnalysisPanel({ latest }) {
-  const peak = latest?.shock ?? "--";
-  const packed = latest?.packedAiStatus ?? 0;
-  
-  let kurtosis = "--";
-  let zcr = "--";
-  let tilt = "--";
-  let rms = "--";
-  let p2p = "--";
-
-  if (latest && packed > 0) {
-    const intPart = Math.floor(packed);
-    kurtosis = Math.floor(intPart / 10000).toString();
-    zcr = Math.floor((intPart % 10000) / 100).toString();
-    tilt = (intPart % 100).toString();
-    
-    const frac = packed - intPart;
-    rms = frac.toFixed(2);
-    p2p = (frac * 2.828).toFixed(2);
-  }
-
-  // Fallback to dummies if packed is 0 and there is a shock (for testing before ESP32 flash)
-  if (packed === 0 && latest?.shock > 0) {
-     rms = (latest.shock * 0.707).toFixed(2);
-     p2p = (latest.shock * 2).toFixed(2);
-     kurtosis = (3.0 + latest.shock).toFixed(1);
-     zcr = Math.floor(20 + latest.shock * 5).toString();
-     tilt = Math.floor(latest.shock * 15).toString();
-  }
-
+function EdgeAIAnalysisPanel({ latest }) {
   const Stat = ({ label, value, desc }) => (
     <div title={desc} style={{ cursor: "help" }}>
       <span style={{ display: "block", color: "#0f172a", fontWeight: 700, marginBottom: 2 }}>{label}</span>
@@ -265,15 +262,15 @@ function ShockAnalysisPanel({ latest }) {
       boxShadow: "0 20px 40px rgba(225,29,72,0.05)",
     }}>
       <div>
-        <span style={{ display: "block", color: "#be123c", fontWeight: 700, marginBottom: 2 }}>Peak Shock</span>
-        <span style={{ color: "#9f1239", fontWeight: 800, fontSize: "1.5rem" }}>{latest?.shock ?? "--"} G</span>
-        <span style={{ display: "block", color: "#fda4af", fontSize: "0.7rem", marginTop: 2, fontWeight: 700 }}>LIVE TELEMETRY</span>
+        <span style={{ display: "block", color: "#be123c", fontWeight: 700, marginBottom: 2 }}>Transport State</span>
+        <span style={{ color: "#9f1239", fontWeight: 800, fontSize: "1.5rem" }}>{latest?.transportState ?? "--"}</span>
+        <span style={{ display: "block", color: "#fda4af", fontSize: "0.7rem", marginTop: 2, fontWeight: 700 }}>AI STATE MACHINE</span>
       </div>
-      <Stat label="RMS" value={latest ? rms : "--"} desc="Overall vibration energy" />
-      <Stat label="Peak-to-Peak" value={latest ? p2p : "--"} desc="Max amplitude swing" />
-      <Stat label="Kurtosis" value={latest ? kurtosis : "--"} desc="Signal impulsiveness" />
-      <Stat label="Zero-Crossing Rate" value={latest ? `${zcr} Hz` : "--"} desc="Vibration frequency" />
-      <Stat label="Tilt Angle" value={latest ? `${tilt}°` : "--"} desc="Physical orientation" />
+      <Stat label="Shock Class" value={latest?.productState ?? "--"} desc="Edge classification" />
+      <Stat label="Peak G-Force" value={latest?.shock != null ? `${latest.shock} G` : "--"} desc="Max impact" />
+      <Stat label="Anomaly Score" value={latest?.anomalyScore ?? "--"} desc="Composite Z-score" />
+      <Stat label="Alert Priority" value={latest?.priority ?? "--"} desc="Transmission urgency" />
+      <Stat label="Location (GPS)" value={latest?.latitude ? `${latest.latitude}, ${latest.longitude}` : "--"} desc="Last known coord" />
     </div>
   );
 }
@@ -358,7 +355,7 @@ export default function IotDashboard() {
     }
   }, [anomalyKey]);
 
-  const shockAnomaly = latest?.productState && latest.productState !== "NORMAL" && latest.productState !== "UNKNOWN";
+  const shockAnomaly = latest?.productState === "MAJOR_IMPACT" || latest?.productState === "FREE_FALL";
 
   const chartData = feeds.map((f) => ({
     time: f.time,
@@ -454,7 +451,7 @@ export default function IotDashboard() {
         display: "grid",
         gap: "1.25rem",
       }}>
-        <ShockAnalysisPanel latest={latest} />
+        <EdgeAIAnalysisPanel latest={latest} />
 
         <section style={{
           display: "grid",
@@ -479,10 +476,10 @@ export default function IotDashboard() {
           />
           <MetricCard
             icon="🧠"
-            label="Product State"
-            value={latest?.productState === "null" ? "UNKNOWN" : (latest?.productState ?? "UNKNOWN")}
+            label="Transport State"
+            value={latest?.transportState === "null" ? "UNKNOWN" : (latest?.transportState ?? "UNKNOWN")}
             unit=""
-            anomaly={shockAnomaly}
+            anomaly={latest?.transportState === "IMPACT_EVENT" || latest?.transportState === "ENV_ALERT" || shockAnomaly}
             sublabel="Contextual state"
           />
           <div style={{ background: "#ffffff", border: "1px solid rgba(15,23,42,0.08)", borderRadius: 24, padding: "1.4rem 1.25rem", display: "flex", flexDirection: "column", gap: 10, boxShadow: "0 12px 24px rgba(15,23,42,0.06)" }}>
@@ -569,7 +566,7 @@ export default function IotDashboard() {
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: "#334155" }}>
                   <thead>
                     <tr>
-                      {['Time', 'Temp', 'Hum', 'Shock', 'RFID'].map((heading) => (
+                      {['Time', 'State', 'Shock', 'Temp', 'Hum', 'PeakG'].map((heading) => (
                         <th key={heading} style={{ textAlign: 'left', padding: '0.85rem 0.5rem', color: '#475569', fontWeight: 700 }}>{heading}</th>
                       ))}
                     </tr>
@@ -578,10 +575,11 @@ export default function IotDashboard() {
                     {feeds.slice(-8).reverse().map((feed, index) => (
                       <tr key={index} style={{ borderTop: '1px solid rgba(15,23,42,0.08)' }}>
                         <td style={{ padding: '0.9rem 0.5rem' }}>{feed.time}</td>
+                        <td style={{ padding: '0.9rem 0.5rem' }}>{feed.transportState}</td>
+                        <td style={{ padding: '0.9rem 0.5rem' }}>{feed.productState}</td>
                         <td style={{ padding: '0.9rem 0.5rem' }}>{feed.temperature != null ? `${feed.temperature}°C` : '--'}</td>
                         <td style={{ padding: '0.9rem 0.5rem' }}>{feed.humidity != null ? `${feed.humidity}%` : '--'}</td>
-                        <td style={{ padding: '0.9rem 0.5rem' }}>{feed.shock != null ? `${feed.shock}` : '--'}</td>
-                        <td style={{ padding: '0.9rem 0.5rem' }}>{feed.rfid ?? '--'}</td>
+                        <td style={{ padding: '0.9rem 0.5rem' }}>{feed.shock != null ? `${feed.shock}G` : '--'}</td>
                       </tr>
                     ))}
                     {feeds.length === 0 && (
