@@ -14,7 +14,7 @@
 //    IN_TRANSIT   — Sustained motion for 5+ seconds
 //    IMPACT_EVENT — Major shock/free-fall (auto-recovers in 5s)
 //    LOADING      — RFID scanned while stationary
-//    ENV_ALERT    — Temperature or humidity anomaly during transit
+//    ENV_ALERT    — Temperature, humidity, or pressure anomaly during transit
 //
 //  Alert Priorities:
 //    CRITICAL — Immediate transmission (impact, free-fall, env anomaly)
@@ -51,6 +51,7 @@ struct AlertEvent {
     ShockClass     shockClass;
     bool           tempAnomaly;
     bool           humAnomaly;
+    bool           pressAnomaly;
     TransportState state;
 };
 
@@ -88,15 +89,16 @@ struct SmartAlerter {
     //  Call this every loop iteration (or every classify cycle).
     //
     //  Parameters:
-    //    shock       - Current shock classification
-    //    rfidScanned - True if a new RFID tag was just scanned
-    //    tempAnomaly - True if temperature Z-score exceeded threshold
-    //    humAnomaly  - True if humidity Z-score exceeded threshold
-    //    rms         - Current accelerometer RMS from shock classifier
-    //    now         - Current millis() timestamp
+    //    shock        - Current shock classification
+    //    rfidScanned  - True if a new RFID tag was just scanned
+    //    tempAnomaly  - True if temperature Z-score exceeded threshold
+    //    humAnomaly   - True if humidity Z-score exceeded threshold
+    //    pressAnomaly - True if pressure Z-score exceeded threshold
+    //    rms          - Current accelerometer RMS from shock classifier
+    //    now          - Current millis() timestamp
     // -------------------------------------------------------
     void updateState(ShockClass shock, bool rfidScanned,
-                     bool tempAnomaly, bool humAnomaly,
+                     bool tempAnomaly, bool humAnomaly, bool pressAnomaly,
                      float rms, unsigned long now) {
 
         previousState = currentState;
@@ -133,12 +135,12 @@ struct SmartAlerter {
                 break;
 
             case STATE_IN_TRANSIT:
-                // Major shock or free-fall → impact event
-                if (shock == SHOCK_MAJOR_IMPACT || shock == SHOCK_FREE_FALL) {
+                // Major shock, minor bump, or free-fall → impact event
+                if (shock == SHOCK_MAJOR_IMPACT || shock == SHOCK_MINOR_BUMP || shock == SHOCK_FREE_FALL) {
                     transitionTo(STATE_IMPACT_EVENT, now);
                 }
                 // Environmental anomaly → alert state
-                else if (tempAnomaly || humAnomaly) {
+                else if (tempAnomaly || humAnomaly || pressAnomaly) {
                     transitionTo(STATE_ENV_ALERT, now);
                 }
                 // Sustained stillness → stationary
@@ -168,22 +170,23 @@ struct SmartAlerter {
                 break;
 
             case STATE_ENV_ALERT:
-                // Anomaly cleared → return to transit
-                if (!tempAnomaly && !humAnomaly) {
+                // All anomalies cleared → return to transit
+                if (!tempAnomaly && !humAnomaly && !pressAnomaly) {
                     transitionTo(STATE_IN_TRANSIT, now);
                 }
                 break;
         }
 
         // --- Evaluate alert priority ---
-        evaluatePriority(shock, tempAnomaly, humAnomaly);
+        evaluatePriority(shock, tempAnomaly, humAnomaly, pressAnomaly);
 
         // --- Store event snapshot ---
-        lastEvent.priority    = pendingPriority;
-        lastEvent.shockClass  = shock;
-        lastEvent.tempAnomaly = tempAnomaly;
-        lastEvent.humAnomaly  = humAnomaly;
-        lastEvent.state       = currentState;
+        lastEvent.priority     = pendingPriority;
+        lastEvent.shockClass   = shock;
+        lastEvent.tempAnomaly  = tempAnomaly;
+        lastEvent.humAnomaly   = humAnomaly;
+        lastEvent.pressAnomaly = pressAnomaly;
+        lastEvent.state        = currentState;
     }
 
     // -------------------------------------------------------
@@ -205,17 +208,23 @@ struct SmartAlerter {
     // -------------------------------------------------------
     //  Internal: determine how urgently we need to transmit.
     // -------------------------------------------------------
-    void evaluatePriority(ShockClass shock, bool tempAnomaly, bool humAnomaly) {
-        // CRITICAL: major impact, free-fall, or combined env anomaly
-        if (shock == SHOCK_MAJOR_IMPACT || shock == SHOCK_FREE_FALL ||
-            (tempAnomaly && humAnomaly)) {
+    void evaluatePriority(ShockClass shock, bool tempAnomaly,
+                          bool humAnomaly, bool pressAnomaly) {
+        // Count active environmental anomalies
+        int envAnomalyCount = (tempAnomaly ? 1 : 0) +
+                              (humAnomaly  ? 1 : 0) +
+                              (pressAnomaly ? 1 : 0);
+
+        // CRITICAL: major impact, minor bump, free-fall, or 2+ simultaneous env anomalies
+        if (shock == SHOCK_MAJOR_IMPACT || shock == SHOCK_MINOR_BUMP ||
+            shock == SHOCK_FREE_FALL || envAnomalyCount >= 2) {
             pendingPriority = PRIORITY_CRITICAL;
             return;
         }
 
-        // HIGH: minor bump, tilt, single env anomaly, or state change
-        if (shock == SHOCK_MINOR_BUMP || shock == SHOCK_TILT_ALERT ||
-            tempAnomaly || humAnomaly ||
+        // HIGH: tilt, any single env anomaly, or state change
+        if (shock == SHOCK_TILT_ALERT ||
+            envAnomalyCount >= 1 ||
             currentState != previousState) {
             pendingPriority = PRIORITY_HIGH;
             return;
@@ -275,20 +284,22 @@ struct SmartAlerter {
     //  Pack the current state, shock class, and anomaly flags
     //  into a single float for ThingSpeak Field 6.
     //
-    //  Format: SSCCTA (decimal digits)
-    //    SS = state (0-4)     × 10000
-    //    CC = shockClass (0-5) × 100
-    //    T  = tempAnomaly      × 10
-    //    A  = humAnomaly       × 1
+    //  Format: SSCCTAP (decimal digits)
+    //    SS = state (0-4)      × 100000
+    //    CC = shockClass (0-5) × 1000
+    //    T  = tempAnomaly      × 100
+    //    A  = humAnomaly       × 10
+    //    P  = pressAnomaly     × 1
     //
-    //  Example: 10201 = IN_TRANSIT, MAJOR_IMPACT, no temp, yes hum
+    //  Example: 102010 = IN_TRANSIT, MAJOR_IMPACT, no temp, yes hum, no press
     // -------------------------------------------------------
     float packStatusField() const {
         return (float)(
-            (int)lastEvent.state      * 10000 +
-            (int)lastEvent.shockClass * 100 +
-            (lastEvent.tempAnomaly ? 10 : 0) +
-            (lastEvent.humAnomaly  ?  1 : 0)
+            (int)lastEvent.state      * 100000 +
+            (int)lastEvent.shockClass * 1000 +
+            (lastEvent.tempAnomaly  ? 100 : 0) +
+            (lastEvent.humAnomaly   ?  10 : 0) +
+            (lastEvent.pressAnomaly ?   1 : 0)
         );
     }
 

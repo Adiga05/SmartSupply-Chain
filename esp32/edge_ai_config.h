@@ -28,12 +28,16 @@
 // Free-fall minimum consecutive samples
 #define FREE_FALL_MIN_SAMPLES     3       // ~60ms at 50Hz
 
+// Impact hold duration — once an impact is classified, it stays
+// as that class for this many ms before allowing downgrade
+#define IMPACT_HOLD_MS            5000    // 5 seconds
+
 // --- Transport State Machine ---
 #define MOTION_RMS_THRESHOLD      0.15f   // RMS above this = motion detected
 #define MOTION_CONFIRM_MS         5000    // 5s sustained motion → IN_TRANSIT
 #define STATIONARY_CONFIRM_MS     30000   // 30s no motion → STATIONARY
 #define LOADING_TIMEOUT_MS        60000   // 60s loading timeout → STATIONARY
-#define IMPACT_RECOVER_MS         20000   // 20s auto-recover from IMPACT_EVENT
+#define IMPACT_RECOVER_MS         5000    // 5s auto-recover from IMPACT_EVENT
 
 // --- Smart Alerting / Transmission Intervals ---
 #define TRANSMIT_INTERVAL_NORMAL  20000   // 20s normal telemetry cycle
@@ -41,7 +45,13 @@
 #define TRANSMIT_INTERVAL_MIN     15000   // 15s ThingSpeak free-tier rate limit
 #define CRITICAL_COOLDOWN_MS      15000   // Min gap between critical alert sends
 
+// --- Location Source ---
+#define LOC_SOURCE_GPS            0
+#define LOC_SOURCE_WIFI_IP        1
+#define LOCATION_SOURCE           LOC_SOURCE_WIFI_IP   // Set default to WiFi IP Geolocation
+
 // --- Debug Output ---
 #define EDGE_AI_DEBUG             1       // 1 = verbose serial logging, 0 = silent
 
 #endif // EDGE_AI_CONFIG_H
+

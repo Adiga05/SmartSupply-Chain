@@ -6,26 +6,32 @@
 //  track transport state, and make smart alerting decisions —
 //  all without cloud dependency.
 //
-//  Sensors: DHT11, MPU6050, GPS (Serial2), MFRC522 RFID
+//  Sensors: BME280, MPU6050, GPS (Serial2), MFRC522 RFID
 //  Cloud:   ThingSpeak (8 fields + status string)
 //
 //  Edge AI Features:
-//    Tier 1 — Statistical anomaly detection (temp/humidity)
+//    Tier 1 — Statistical anomaly detection (temp/humidity/pressure)
 //    Tier 2 — Accelerometer shock/impact classification
 //    Tier 3 — Transport state machine + smart alerting
 // ============================================================
+
+// --- Edge AI Modules (must come first for macros used in conditional includes) ---
+#include "edge_ai_config.h"
 
 #include <WiFi.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <ThingSpeak.h>
-#include <DHT.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 #include <MPU6050_light.h>
+#if LOCATION_SOURCE == LOC_SOURCE_GPS
 #include <TinyGPS++.h>
+#elif LOCATION_SOURCE == LOC_SOURCE_WIFI_IP
+#include <HTTPClient.h>
+#endif
 #include <MFRC522.h>
 
-// --- Edge AI Modules ---
-#include "edge_ai_config.h"
 #include "anomaly_detector.h"
 #include "shock_classifier.h"
 #include "transport_state.h"
@@ -39,19 +45,20 @@ const char* myWriteAPIKey  = "P355FVMTNZJJHIJC";
 WiFiClient client;
 
 // ========================== HARDWARE =============================
-#define DHTPIN  32
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BME280 bme;   // I2C BME280 (shares bus with MPU6050)
 
 MPU6050    mpu(Wire);
+#if LOCATION_SOURCE == LOC_SOURCE_GPS
 TinyGPSPlus gps;
+#endif
 MFRC522    rfid(5, 4);   // SS = GPIO 5, RST = GPIO 4
 
 // ========================== EDGE AI ==============================
-AnomalyDetector tempDetector;    // Temperature anomaly detector
-AnomalyDetector humDetector;     // Humidity anomaly detector
-ShockClassifier shockClassifier; // Accelerometer shock classifier
-SmartAlerter    alerter;         // Transport state + smart alerting
+AnomalyDetector tempDetector;     // Temperature anomaly detector
+AnomalyDetector humDetector;      // Humidity anomaly detector
+AnomalyDetector pressDetector;    // Pressure anomaly detector
+ShockClassifier shockClassifier;  // Accelerometer shock classifier
+SmartAlerter    alerter;          // Transport state + smart alerting
 
 // ========================== TIMING ===============================
 unsigned long lastTransmitTime    = 0;
@@ -61,15 +68,63 @@ unsigned long lastClassifyTime    = 0;
 // ========================== SENSOR DATA ==========================
 float  tempC    = 0.0f;
 float  humidity = 0.0f;
+float  pressure = 0.0f;   // Pressure in hPa
 double latitude = 0.0;
 double longitude = 0.0;
+
+#if LOCATION_SOURCE == LOC_SOURCE_WIFI_IP
+bool fetchLocationByIP(double &lat, double &lon) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    HTTPClient http;
+    http.setTimeout(5000); // 5 second timeout
+    http.begin("http://ip-api.com/json/");
+    int httpCode = http.GET();
+    
+    bool success = false;
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        Serial.println("[GeoIP] Response: " + payload);
+        
+        int latPos = payload.indexOf("\"lat\":");
+        int lonPos = payload.indexOf("\"lon\":");
+        
+        if (latPos != -1 && lonPos != -1) {
+            int latStart = latPos + 6;
+            int latEnd = payload.indexOf(",", latStart);
+            if (latEnd == -1) latEnd = payload.indexOf("}", latStart);
+            
+            int lonStart = lonPos + 6;
+            int lonEnd = payload.indexOf(",", lonStart);
+            if (lonEnd == -1) lonEnd = payload.indexOf("}", lonStart);
+            
+            if (latEnd != -1 && lonEnd != -1) {
+                String latStr = payload.substring(latStart, latEnd);
+                String lonStr = payload.substring(lonStart, lonEnd);
+                latStr.trim();
+                lonStr.trim();
+                lat = latStr.toDouble();
+                lon = lonStr.toDouble();
+                success = true;
+            }
+        }
+    } else {
+        Serial.printf("[GeoIP] HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+    return success;
+}
+#endif
+
 unsigned long lastScannedRFID = 0;
 bool   newRFIDScanned  = false;
 
 // ========================== AI STATE =============================
 ShockClass currentShockClass = SHOCK_NORMAL;
-bool  tempAnomaly = false;
-bool  humAnomaly  = false;
+bool  tempAnomaly  = false;
+bool  humAnomaly   = false;
+bool  pressAnomaly = false;
 float peakG       = 0.0f;   // Peak G-force since last transmission
 
 // =================================================================
@@ -77,7 +132,9 @@ float peakG       = 0.0f;   // Peak G-force since last transmission
 // =================================================================
 void setup() {
     Serial.begin(115200);
+#if LOCATION_SOURCE == LOC_SOURCE_GPS
     Serial2.begin(9600, SERIAL_8N1, 16, 17);  // GPS on UART2
+#endif
 
     // --- WiFi ---
     WiFi.begin(ssid, password);
@@ -88,6 +145,15 @@ void setup() {
     }
     Serial.println("\nWi-Fi Connected!");
 
+#if LOCATION_SOURCE == LOC_SOURCE_WIFI_IP
+    Serial.println("[GeoIP] Fetching location from IP...");
+    if (fetchLocationByIP(latitude, longitude)) {
+        Serial.printf("[GeoIP] Successfully retrieved location: %.6f, %.6f\n", latitude, longitude);
+    } else {
+        Serial.println("[GeoIP] Failed to fetch location. Defaulting to 0.0, 0.0.");
+    }
+#endif
+
     // --- Peripherals ---
     ThingSpeak.begin(client);
     Wire.begin();
@@ -96,9 +162,12 @@ void setup() {
     delay(4);
     rfid.PCD_DumpVersionToSerial(); // Add diagnostic output for RFID hardware
 
-    // --- DHT11 ---
-    dht.begin();
-    Serial.println("DHT11 Initialized.");
+    // --- BME280 ---
+    if (!bme.begin(0x76)) {   // Default I2C address; use 0x77 if SDO is high
+        Serial.println("BME280 NOT FOUND! Check wiring.");
+    } else {
+        Serial.println("BME280 Initialized.");
+    }
 
     // --- MPU6050 ---
     byte mpuStatus = mpu.begin();
@@ -115,6 +184,7 @@ void setup() {
     // --- Edge AI Initialization ---
     tempDetector.init(ANOMALY_EMA_ALPHA, ANOMALY_Z_THRESHOLD);
     humDetector.init(ANOMALY_EMA_ALPHA, ANOMALY_Z_THRESHOLD);
+    pressDetector.init(ANOMALY_EMA_ALPHA, ANOMALY_Z_THRESHOLD);
     shockClassifier.init();
     alerter.init();
 
@@ -184,12 +254,14 @@ void loop() {
         lastClassifyTime = now;
     }
 
+#if LOCATION_SOURCE == LOC_SOURCE_GPS
     // ─────────────────────────────────────────────────────────────
     //  4. CONTINUOUS: Poll GPS buffer
     // ─────────────────────────────────────────────────────────────
     while (Serial2.available() > 0) {
         gps.encode(Serial2.read());
     }
+#endif
 
     // ─────────────────────────────────────────────────────────────
     //  5. CONTINUOUS: Poll RFID scanner
@@ -215,6 +287,7 @@ void loop() {
         newRFIDScanned,
         tempAnomaly,
         humAnomaly,
+        pressAnomaly,
         shockClassifier.getRMS(),
         now
     );
@@ -234,16 +307,17 @@ void loop() {
 
 // =================================================================
 //  TELEMETRY TRANSMISSION
-//  Reads DHT11, runs anomaly detection, packs all AI outputs
+//  Reads BME280, runs anomaly detection, packs all AI outputs
 //  into ThingSpeak fields, and pushes to the cloud.
 // =================================================================
 void transmitTelemetry(unsigned long now) {
 
-    // --- Read DHT11 sensor ---
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
+    // --- Read BME280 sensor ---
+    float t = bme.readTemperature();
+    float h = bme.readHumidity();
+    float p = bme.readPressure() / 100.0f;  // Pa → hPa
 
-    // DHT11 sometimes returns NaN — only update and analyze valid reads
+    // BME280 returns valid floats; update and analyze
     if (!isnan(t)) {
         tempC = t;
         tempAnomaly = tempDetector.update(tempC);
@@ -251,6 +325,10 @@ void transmitTelemetry(unsigned long now) {
     if (!isnan(h)) {
         humidity = h;
         humAnomaly = humDetector.update(humidity);
+    }
+    if (!isnan(p)) {
+        pressure = p;
+        pressAnomaly = pressDetector.update(pressure);
     }
 
     // --- Log anomalies ---
@@ -267,6 +345,12 @@ void transmitTelemetry(unsigned long now) {
             humDetector.mean, humDetector.getStdDev(),
             humDetector.getEMA());
     }
+    if (pressAnomaly) {
+        Serial.printf("[ANOMALY] Press: %.1f hPa | Z=%.2f | mean=%.1f | std=%.2f | EMA=%.1f\n",
+            pressure, pressDetector.getZScore(pressure),
+            pressDetector.mean, pressDetector.getStdDev(),
+            pressDetector.getEMA());
+    }
     // Log drift detection
     if (tempDetector.isDrifting(tempC)) {
         Serial.printf("[DRIFT]  Temperature drifting from EMA (%.1f vs EMA %.1f)\n",
@@ -276,36 +360,43 @@ void transmitTelemetry(unsigned long now) {
         Serial.printf("[DRIFT]  Humidity drifting from EMA (%.1f vs EMA %.1f)\n",
             humidity, humDetector.getEMA());
     }
+    if (pressDetector.isDrifting(pressure)) {
+        Serial.printf("[DRIFT]  Pressure drifting from EMA (%.1f vs EMA %.1f)\n",
+            pressure, pressDetector.getEMA());
+    }
     #endif
 
+#if LOCATION_SOURCE == LOC_SOURCE_GPS
     // --- Update GPS ---
     if (gps.location.isValid()) {
         latitude  = gps.location.lat();
         longitude = gps.location.lng();
     }
+#endif
 
-    // --- Compute composite anomaly score ---
-    float tempZ = tempDetector.warmedUp ? fabsf(tempDetector.getZScore(tempC)) : 0.0f;
-    float humZ  = humDetector.warmedUp  ? fabsf(humDetector.getZScore(humidity)) : 0.0f;
-    float anomalyScore = (tempZ + humZ) / 2.0f;
+    // --- Compute composite anomaly score (3-factor average) ---
+    float tempZ  = tempDetector.warmedUp  ? fabsf(tempDetector.getZScore(tempC))     : 0.0f;
+    float humZ   = humDetector.warmedUp   ? fabsf(humDetector.getZScore(humidity))   : 0.0f;
+    float pressZ = pressDetector.warmedUp ? fabsf(pressDetector.getZScore(pressure)) : 0.0f;
+    float anomalyScore = (tempZ + humZ + pressZ) / 3.0f;
 
     // ─────────────────────────────────────────────────────────────
     //  ThingSpeak Field Mapping:
     //
     //  Field 1: Temperature (°C)              — raw sensor
     //  Field 2: Humidity (%)                   — raw sensor
-    //  Field 3: Shock Class (0-5 enum)         — AI classification
+    //  Field 3: Pressure (hPa)                — raw sensor
     //  Field 4: Latitude                       — GPS
     //  Field 5: Longitude                      — GPS
-    //  Field 6: Packed Status (SSCCTA)         — AI state encoding
+    //  Field 6: Packed Status (SSCCTAP)        — AI state encoding
     //  Field 7: Peak G-force                   — max G since last TX
     //  Field 8: Anomaly Score                  — avg |Z-score|
     // ─────────────────────────────────────────────────────────────
     ThingSpeak.setField(1, tempC);
     ThingSpeak.setField(2, humidity);
-    ThingSpeak.setField(3, (int)currentShockClass);
-    ThingSpeak.setField(4, (float)latitude);
-    ThingSpeak.setField(5, (float)longitude);
+    ThingSpeak.setField(3, pressure);
+    ThingSpeak.setField(4, String(latitude, 8));
+    ThingSpeak.setField(5, String(longitude, 8));
     ThingSpeak.setField(6, alerter.packStatusField());
     ThingSpeak.setField(7, peakG);
     ThingSpeak.setField(8, anomalyScore);
@@ -329,9 +420,9 @@ void transmitTelemetry(unsigned long now) {
         Serial.printf("     Shock:  %s (class %d)\n",
             shockClassifier.classToString(currentShockClass),
             (int)currentShockClass);
-        Serial.printf("     Temp:   %.1f°C  Hum: %.1f%%\n", tempC, humidity);
+        Serial.printf("     Temp:   %.1f°C  Hum: %.1f%%  Press: %.1f hPa\n", tempC, humidity, pressure);
         Serial.printf("     PeakG:  %.2f   AnomalyScore: %.2f\n", peakG, anomalyScore);
-        Serial.printf("     GPS:    %.6f, %.6f\n", latitude, longitude);
+        Serial.printf("     GPS:    %.8f, %.8f\n", latitude, longitude);
         Serial.printf("     Status: %s\n", status.c_str());
         Serial.println("────────────────────────────────────────");
     } else {
@@ -343,5 +434,13 @@ void transmitTelemetry(unsigned long now) {
     if (alerter.pendingPriority == PRIORITY_CRITICAL) {
         alerter.lastCriticalSend = now;
     }
+
+    // --- Clear permanent latches after transmission ---
+    // The event has been pushed to cloud; resume normal classification
+    shockClassifier.permanentMajorImpact = false;
+    shockClassifier.permanentMinorBump = false;
+    shockClassifier.resetInstantPeaks();
+    currentShockClass = SHOCK_NORMAL;
+
     lastTransmitTime = now;
 }

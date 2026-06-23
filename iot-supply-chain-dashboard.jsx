@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import emailjs from "@emailjs/browser";
 import {
   AreaChart,
   Area,
@@ -26,6 +27,23 @@ const THINGSPEAK_CONFIG = {
   POLL_INTERVAL_MS: 20000,
 };
 
+// Change this value to set the dashboard login password.
+const DASHBOARD_PASSWORD = "123456";
+
+// ============================================================
+// EMAIL ALERTS — EmailJS configuration
+// Sender: pranavadiga55@gmail.com (connect this Gmail in EmailJS)
+// Receiver: kiransk5855@gmail.com
+// Sign up at https://www.emailjs.com and fill in the values below.
+// ============================================================
+const EMAILJS_CONFIG = {
+  SERVICE_ID: "service_uv6g7wm",      // EmailJS → Email Services → Service ID
+  TEMPLATE_ID: "template_x9jpube",    // EmailJS → Email Templates → Template ID
+  PUBLIC_KEY: "NNDPG_cYWOvlKCm07",       // EmailJS → Account → API Keys → Public Key
+  TO_EMAIL: "ksk5842hh@gmail.com",  // recipient email address
+  COOLDOWN_MS: 5 * 60 * 1000,         // 5 minutes between emails
+};
+
 
 
 const safeFloat = (val, decimals = 2) => {
@@ -37,6 +55,9 @@ const fmt = (val, unit = "", decimals = 1) => {
   if (val === null || val === undefined) return "--";
   return `${safeFloat(val, decimals) ?? "--"}${unit}`;
 };
+
+const fmtCoordinate = (val) =>
+  Number.isFinite(val) ? val.toFixed(6) : "--";
 
 const fmtTime = (iso) => {
   try {
@@ -52,35 +73,46 @@ const fmtTime = (iso) => {
 };
 
 const fetchThingSpeakData = async () => {
-  const url = `https://api.thingspeak.com/channels/${THINGSPEAK_CONFIG.CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_CONFIG.READ_API_KEY}&results=${THINGSPEAK_CONFIG.RESULTS}`;
+  const url = `https://api.thingspeak.com/channels/${THINGSPEAK_CONFIG.CHANNEL_ID}/feeds.json?api_key=${THINGSPEAK_CONFIG.READ_API_KEY}&results=${THINGSPEAK_CONFIG.RESULTS}&status=true`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
   const json = await resp.json();
   if (!json?.feeds?.length) throw new Error("No feeds returned");
   return json.feeds.map((f) => {
-    let shockStr = "NORMAL";
-    const sc = parseInt(f.field3);
-    if (sc === 1) shockStr = "MINOR_BUMP";
-    else if (sc === 2) shockStr = "MAJOR_IMPACT";
-    else if (sc === 3) shockStr = "FREE_FALL";
-    else if (sc === 4) shockStr = "TILT_ALERT";
-    else if (sc === 5) shockStr = "VIBRATION";
-
     const packed = parseFloat(f.field6) || 0;
     const intPacked = Math.floor(packed);
-    const ss = Math.floor(intPacked / 10000);
-    const tempAnom = Math.floor((intPacked % 100) / 10) === 1;
-    const humAnom = (intPacked % 10) === 1;
+    const ss = Math.floor(intPacked / 100000);
+    const sc = Math.floor((intPacked % 100000) / 1000);
+    const tempAnom = Math.floor((intPacked % 1000) / 100) === 1;
+    const humAnom = Math.floor((intPacked % 100) / 10) === 1;
+    const pressAnom = (intPacked % 10) === 1;
 
-    let transportState = "UNKNOWN";
-    if (ss === 0) transportState = "STATIONARY";
-    else if (ss === 1) transportState = "IN_TRANSIT";
-    else if (ss === 2) transportState = "IMPACT_EVENT";
-    else if (ss === 3) transportState = "LOADING";
-    else if (ss === 4) transportState = "ENV_ALERT";
+    let decodedShockState = "NORMAL";
+    if (sc === 1) decodedShockState = "MINOR_BUMP";
+    else if (sc === 2) decodedShockState = "MAJOR_IMPACT";
+    else if (sc === 3) decodedShockState = "FREE_FALL";
+    else if (sc === 4) decodedShockState = "TILT_ALERT";
+    else if (sc === 5) decodedShockState = "VIBRATION";
 
-    // Extract Priority and RFID from ThingSpeak status string
+    let decodedTransportState = "UNKNOWN";
+    if (ss === 0) decodedTransportState = "STATIONARY";
+    else if (ss === 1) decodedTransportState = "IN_TRANSIT";
+    else if (ss === 2) decodedTransportState = "IMPACT_EVENT";
+    else if (ss === 3) decodedTransportState = "LOADING";
+    else if (ss === 4) decodedTransportState = "ENV_ALERT";
+
+    // The readable status is the primary state source and also carries pressure.
     const statusParts = (f.status || "").split("|");
+    const statusTransportState = statusParts[0]?.trim();
+    const validTransportStates = ["STATIONARY", "IN_TRANSIT", "IMPACT_EVENT", "LOADING", "ENV_ALERT"];
+    const transportState = validTransportStates.includes(statusTransportState)
+      ? statusTransportState
+      : decodedTransportState;
+    const statusShockState = statusParts[1]?.trim();
+    const validShockStates = ["NORMAL", "MINOR_BUMP", "MAJOR_IMPACT", "FREE_FALL", "TILT_ALERT", "VIBRATION"];
+    const productState = validShockStates.includes(statusShockState)
+      ? statusShockState
+      : decodedShockState;
     const priority = statusParts.length >= 3 ? statusParts[2] : "NORMAL";
     const rfidValue = statusParts.length >= 4 ? statusParts[3] : "0";
 
@@ -89,14 +121,16 @@ const fetchThingSpeakData = async () => {
       time: fmtTime(f.created_at),
       temperature: safeFloat(f.field1),
       humidity: safeFloat(f.field2),
+      pressure: safeFloat(f.field3, 2),
       shock: safeFloat(f.field7),
-      productState: shockStr,
+      productState,
       latitude: safeFloat(f.field4, 6),
       longitude: safeFloat(f.field5, 6),
       packedAiStatus: packed,
       transportState,
       tempAnomaly: tempAnom,
       humAnomaly: humAnom,
+      pressAnomaly: pressAnom,
       anomalyScore: safeFloat(f.field8, 2),
       priority,
       rfid: (rfidValue === "0" || rfidValue === "") ? "NO TAG" : rfidValue
@@ -135,11 +169,14 @@ function useThingSpeak() {
 
   const anomalies = latest
     ? [
-        (latest.productState === "MAJOR_IMPACT" || latest.productState === "FREE_FALL") &&
-          `Impact Alert: ${latest.productState} detected!`,
-        latest.tempAnomaly && `Temperature Anomaly Detected! Score: ${latest.anomalyScore}`,
-        latest.humAnomaly && `Humidity Anomaly Detected! Score: ${latest.anomalyScore}`
-      ].filter(Boolean)
+      (latest.productState === "MAJOR_IMPACT" || latest.productState === "FREE_FALL" ||
+        latest.transportState === "IMPACT_EVENT" || (latest.shock != null && latest.shock >= 2.5)) &&
+      `🚨 Impact Alert: ${latest.transportState === "IMPACT_EVENT" ? "IMPACT_EVENT" : latest.productState} detected! (Peak: ${latest.shock ?? "?"}G)`,
+      latest.productState === "MINOR_BUMP" &&
+      `⚠️ Minor Bump detected (Peak: ${latest.shock ?? "?"}G)`,
+      latest.tempAnomaly && `🌡️ Temperature Anomaly Detected! Score: ${latest.anomalyScore}`,
+      latest.humAnomaly && `💧 Humidity Anomaly Detected! Score: ${latest.anomalyScore}`
+    ].filter(Boolean)
     : [];
 
   return { feeds, latest, status, error, lastFetched, anomalies, refetch: fetchData };
@@ -223,7 +260,7 @@ function MetricCard({ icon, label, value, unit, anomaly, sublabel }) {
   );
 }
 
-function ChartPanel({ title, children }) {
+function ChartPanel({ title, headerCenter, headerRight, children }) {
   return (
     <div style={{
       background: "#f8fdff",
@@ -234,7 +271,16 @@ function ChartPanel({ title, children }) {
       minWidth: 0,
       flex: 1,
     }}>
-      <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#1e293b" }}>{title}</p>
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "minmax(0, 1fr) auto minmax(0, 1fr)",
+        alignItems: "center",
+        gap: "1rem",
+      }}>
+        <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: "#1e293b" }}>{title}</p>
+        <div style={{ justifySelf: "center", textAlign: "center" }}>{headerCenter}</div>
+        <div style={{ justifySelf: "end" }}>{headerRight}</div>
+      </div>
       {children}
     </div>
   );
@@ -261,17 +307,173 @@ function EdgeAIAnalysisPanel({ latest }) {
       alignItems: "start",
       boxShadow: "0 20px 40px rgba(225,29,72,0.05)",
     }}>
-      <div>
-        <span style={{ display: "block", color: "#be123c", fontWeight: 700, marginBottom: 2 }}>Transport State</span>
-        <span style={{ color: "#9f1239", fontWeight: 800, fontSize: "1.5rem" }}>{latest?.transportState ?? "--"}</span>
-        <span style={{ display: "block", color: "#fda4af", fontSize: "0.7rem", marginTop: 2, fontWeight: 700 }}>AI STATE MACHINE</span>
-      </div>
       <Stat label="Shock Class" value={latest?.productState ?? "--"} desc="Edge classification" />
       <Stat label="Peak G-Force" value={latest?.shock != null ? `${latest.shock} G` : "--"} desc="Max impact" />
-      <Stat label="Anomaly Score" value={latest?.anomalyScore ?? "--"} desc="Composite Z-score" />
       <Stat label="Alert Priority" value={latest?.priority ?? "--"} desc="Transmission urgency" />
-      <Stat label="Location (GPS)" value={latest?.latitude ? `${latest.latitude}, ${latest.longitude}` : "--"} desc="Last known coord" />
+      <Stat
+        label="Transport State"
+        value={latest?.transportState ?? "UNKNOWN"}
+        desc="Current journey state"
+      />
     </div>
+  );
+}
+
+function LocationMap({ latitude, longitude }) {
+  const mapContainerRef = useRef(null);
+  const [mapWidth, setMapWidth] = useState(0);
+
+  const hasCoordinates =
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    latitude >= -90 &&
+    latitude <= 90 &&
+    longitude >= -180 &&
+    longitude <= 180;
+
+  useEffect(() => {
+    if (!hasCoordinates) return undefined;
+
+    const container = mapContainerRef.current;
+    if (!container) return undefined;
+
+    const updateWidth = () => {
+      const nextWidth = Math.round(container.getBoundingClientRect().width);
+      setMapWidth((currentWidth) => currentWidth === nextWidth ? currentWidth : nextWidth);
+    };
+
+    updateWidth();
+    const resizeObserver = new ResizeObserver(updateWidth);
+    resizeObserver.observe(container);
+
+    return () => resizeObserver.disconnect();
+  }, [hasCoordinates]);
+
+  if (!hasCoordinates) {
+    return (
+      <ChartPanel title="Live Asset Location">
+        <div style={{
+          minHeight: 340,
+          display: "grid",
+          placeItems: "center",
+          borderRadius: 18,
+          border: "1px dashed rgba(100,116,139,0.35)",
+          background: "linear-gradient(135deg, rgba(132,204,255,0.08), rgba(122,190,128,0.08))",
+          color: "#64748b",
+          textAlign: "center",
+          padding: "2rem",
+        }}>
+          <div>
+            <div style={{ fontSize: 36, marginBottom: 10 }}>📍</div>
+            <p style={{ margin: 0, fontWeight: 700, color: "#334155" }}>Waiting for GPS coordinates</p>
+            <p style={{ margin: "0.4rem 0 0", fontSize: 13 }}>The map will appear when a valid location is received.</p>
+          </div>
+        </div>
+      </ChartPanel>
+    );
+  }
+
+  const mapSpan = 0.025;
+  const bbox = [
+    longitude - mapSpan,
+    latitude - mapSpan,
+    longitude + mapSpan,
+    latitude + mapSpan,
+  ].join(",");
+  const latitudeText = fmtCoordinate(latitude);
+  const longitudeText = fmtCoordinate(longitude);
+  const embedUrl = `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bbox)}&layer=mapnik&marker=${encodeURIComponent(`${latitudeText},${longitudeText}`)}`;
+  const fullMapUrl = `https://www.openstreetmap.org/?mlat=${encodeURIComponent(latitudeText)}&mlon=${encodeURIComponent(longitudeText)}#map=15/${latitudeText}/${longitudeText}`;
+
+  return (
+    <ChartPanel
+      title="Live Asset Location"
+      headerCenter={
+        <div>
+          <span style={{ display: "block", color: "#64748b", fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+            Current coordinates
+          </span>
+          <span style={{ color: "#0f172a", fontSize: 14, fontWeight: 700, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+            {latitudeText}, {longitudeText}
+          </span>
+        </div>
+      }
+      headerRight={
+        <a
+          href={fullMapUrl}
+          target="_blank"
+          rel="noreferrer"
+          style={{
+            background: "#dbeafe",
+            color: "#1d4ed8",
+            borderRadius: 999,
+            padding: "0.65rem 1rem",
+            fontSize: 13,
+            fontWeight: 700,
+            textDecoration: "none",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Open full map ↗
+        </a>
+      }
+    >
+      <div style={{
+        marginTop: "1rem",
+        borderRadius: 18,
+        overflow: "hidden",
+        border: "1px solid rgba(15,23,42,0.1)",
+        background: "#e2e8f0",
+        width: "100%",
+        height: 420,
+      }}>
+        <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }}>
+          {mapWidth > 0 && (
+            <iframe
+              key={`${latitudeText}-${longitudeText}-${mapWidth}`}
+              title={`Asset location at ${latitudeText}, ${longitudeText}`}
+              src={embedUrl}
+              width={mapWidth}
+              height="420"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+            />
+          )}
+        </div>
+      </div>
+      <div style={{
+        display: "none",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "0.75rem",
+        marginTop: "0.9rem",
+      }}>
+        <div>
+          <span style={{ display: "block", color: "#64748b", fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase" }}>Current coordinates</span>
+          <span style={{ color: "#0f172a", fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+            {latitudeText}, {longitudeText}
+          </span>
+        </div>
+        <a
+          href={fullMapUrl}
+          target="_blank"
+          rel="noreferrer"
+          style={{
+            background: "#dbeafe",
+            color: "#1d4ed8",
+            borderRadius: 999,
+            padding: "0.65rem 1rem",
+            fontSize: 13,
+            fontWeight: 700,
+            textDecoration: "none",
+          }}
+        >
+          Open full map ↗
+        </a>
+      </div>
+    </ChartPanel>
   );
 }
 
@@ -342,7 +544,263 @@ function StatusOverlay({ status, error, onRetry }) {
   );
 }
 
-export default function IotDashboard() {
+// ============================================================
+// Background anomaly email alert hook
+// Polls ThingSpeak when user is NOT logged in and sends
+// an email via EmailJS when anomalies are detected.
+// ============================================================
+function useAnomalyEmailAlert(enabled) {
+  const lastEmailSentRef = useRef(0);
+  const timerRef = useRef(null);
+
+  useEffect(() => {
+    if (!enabled) {
+      clearInterval(timerRef.current);
+      return;
+    }
+
+    const checkAndAlert = async () => {
+      try {
+        const feeds = await fetchThingSpeakData();
+        if (!feeds.length) return;
+        const latest = feeds[feeds.length - 1];
+
+        // Build anomaly messages using same logic as useThingSpeak
+        const anomalyMessages = [
+          (latest.productState === "MAJOR_IMPACT" || latest.productState === "FREE_FALL" ||
+            latest.transportState === "IMPACT_EVENT" || (latest.shock != null && latest.shock >= 2.5)) &&
+          `🚨 Impact Alert: ${latest.transportState === "IMPACT_EVENT" ? "IMPACT_EVENT" : latest.productState} detected! (Peak: ${latest.shock ?? "?"}G)`,
+          latest.productState === "MINOR_BUMP" &&
+          `⚠️ Minor Bump detected (Peak: ${latest.shock ?? "?"}G)`,
+          latest.tempAnomaly && `🌡️ Temperature Anomaly Detected! Score: ${latest.anomalyScore}`,
+          latest.humAnomaly && `💧 Humidity Anomaly Detected! Score: ${latest.anomalyScore}`,
+        ].filter(Boolean);
+
+        if (anomalyMessages.length === 0) return;
+
+        // Enforce cooldown to prevent email spam
+        const now = Date.now();
+        if (now - lastEmailSentRef.current < EMAILJS_CONFIG.COOLDOWN_MS) return;
+
+        // Send email
+        const templateParams = {
+          to_email: EMAILJS_CONFIG.TO_EMAIL,
+          subject: `⚠️ Supply Chain Anomaly Alert`,
+          message: anomalyMessages.join("\n"),
+          temperature: latest.temperature != null ? `${latest.temperature}°C` : "--",
+          humidity: latest.humidity != null ? `${latest.humidity}%` : "--",
+          pressure: latest.pressure != null ? `${latest.pressure} hPa` : "--",
+          shock: latest.shock != null ? `${latest.shock} G` : "--",
+          transport_state: latest.transportState ?? "UNKNOWN",
+          product_state: latest.productState ?? "UNKNOWN",
+          timestamp: new Date(latest.timestamp).toLocaleString(),
+        };
+
+        await emailjs.send(
+          EMAILJS_CONFIG.SERVICE_ID,
+          EMAILJS_CONFIG.TEMPLATE_ID,
+          templateParams,
+          EMAILJS_CONFIG.PUBLIC_KEY
+        );
+
+        lastEmailSentRef.current = now;
+        console.log("[AnomalyAlert] Email sent:", anomalyMessages);
+      } catch (err) {
+        console.error("[AnomalyAlert] Error:", err);
+      }
+    };
+
+    // Check immediately, then on the polling interval
+    checkAndAlert();
+    timerRef.current = setInterval(checkAndAlert, THINGSPEAK_CONFIG.POLL_INTERVAL_MS);
+
+    return () => clearInterval(timerRef.current);
+  }, [enabled]);
+}
+
+function LoginPage({ onLogin }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const inputRef = useRef(null);
+
+  // Run anomaly email alerts while on the login page (not logged in)
+  useAnomalyEmailAlert(true);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+
+    if (password.length !== 6) {
+      setError("Enter all 6 digits.");
+      return;
+    }
+
+    if (password !== DASHBOARD_PASSWORD) {
+      setError("Incorrect password. Please try again.");
+      setPassword("");
+      inputRef.current?.focus();
+      return;
+    }
+
+    onLogin();
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      display: "grid",
+      placeItems: "center",
+      padding: "1.5rem",
+      background: "linear-gradient(145deg, #e8fbff 0%, #ecfff3 48%, #fff0f5 100%)",
+      fontFamily: "'Plus Jakarta Sans', 'Inter', sans-serif",
+      color: "#0f172a",
+      overflow: "hidden",
+      position: "relative",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        @keyframes loginFloat {
+          0%, 100% { transform: translateY(0); }
+          50% { transform: translateY(-12px); }
+        }
+        .login-input:focus {
+          outline: none;
+          border-color: #7dd3fc !important;
+          box-shadow: 0 0 0 5px rgba(125, 211, 252, 0.2);
+        }
+        .login-button:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 14px 28px rgba(99, 102, 241, 0.28) !important;
+        }
+      `}</style>
+
+      <div style={{
+        position: "absolute",
+        width: 320,
+        height: 320,
+        borderRadius: "50%",
+        background: "rgba(132, 204, 255, 0.22)",
+        top: "-100px",
+        right: "-70px",
+        filter: "blur(2px)",
+        animation: "loginFloat 7s ease-in-out infinite",
+      }} />
+      <div style={{
+        position: "absolute",
+        width: 260,
+        height: 260,
+        borderRadius: "50%",
+        background: "rgba(255, 180, 207, 0.2)",
+        bottom: "-90px",
+        left: "-50px",
+        animation: "loginFloat 8s ease-in-out infinite reverse",
+      }} />
+
+      <main style={{
+        width: "min(100%, 460px)",
+        padding: "2.5rem",
+        borderRadius: 32,
+        background: "rgba(255, 255, 255, 0.74)",
+        border: "1px solid rgba(255, 255, 255, 0.95)",
+        boxShadow: "0 28px 70px rgba(15, 23, 42, 0.12)",
+        backdropFilter: "blur(20px)",
+        WebkitBackdropFilter: "blur(20px)",
+        position: "relative",
+        zIndex: 1,
+      }}>
+        <div style={{
+          width: 68,
+          height: 68,
+          display: "grid",
+          placeItems: "center",
+          marginBottom: "1.5rem",
+          borderRadius: 22,
+          background: "linear-gradient(135deg, #bfdbfe, #bbf7d0)",
+          fontSize: 32,
+          boxShadow: "0 12px 24px rgba(56, 189, 248, 0.18)",
+        }}>
+          🚚
+        </div>
+
+        <p style={{ margin: 0, color: "#64748b", fontSize: 12, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" }}>
+          Supply Chain IoT
+        </p>
+        <h1 style={{ margin: "0.65rem 0 0", fontSize: 34, letterSpacing: "-0.035em" }}>
+          Welcome back
+        </h1>
+        <p style={{ margin: "0.75rem 0 2rem", color: "#64748b", lineHeight: 1.65 }}>
+          Enter your password to access the asset monitoring dashboard.
+        </p>
+
+        <form onSubmit={handleSubmit}>
+          <label htmlFor="dashboard-password" style={{ display: "block", marginBottom: "0.6rem", color: "#334155", fontSize: 13, fontWeight: 700 }}>
+            Enter password
+          </label>
+          <input
+            ref={inputRef}
+            id="dashboard-password"
+            className="login-input"
+            type="password"
+            inputMode="numeric"
+            pattern="[0-9]{6}"
+            autoComplete="off"
+            maxLength={6}
+            value={password}
+            onChange={(event) => {
+              setPassword(event.target.value.replace(/\D/g, "").slice(0, 6));
+              setError("");
+            }}
+            aria-invalid={Boolean(error)}
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              border: `1px solid ${error ? "#fb7185" : "rgba(100,116,139,0.25)"}`,
+              borderRadius: 18,
+              background: "rgba(255,255,255,0.9)",
+              padding: "1rem 1.1rem",
+              color: "#0f172a",
+              fontFamily: "inherit",
+              fontSize: 24,
+              fontWeight: 700,
+              letterSpacing: "0.42em",
+              textAlign: "center",
+              transition: "all 0.2s ease",
+            }}
+          />
+          <div style={{ minHeight: 31, paddingTop: "0.55rem" }}>
+            {error && <span style={{ color: "#e11d48", fontSize: 12, fontWeight: 600 }}>{error}</span>}
+          </div>
+          <button
+            className="login-button"
+            type="submit"
+            disabled={password.length !== 6}
+            style={{
+              width: "100%",
+              border: 0,
+              borderRadius: 18,
+              padding: "1rem",
+              background: password.length === 6 ? "linear-gradient(135deg, #818cf8, #38bdf8)" : "#cbd5e1",
+              color: "#ffffff",
+              cursor: password.length === 6 ? "pointer" : "not-allowed",
+              fontFamily: "inherit",
+              fontSize: 15,
+              fontWeight: 700,
+              boxShadow: password.length === 6 ? "0 10px 22px rgba(99, 102, 241, 0.22)" : "none",
+              transition: "all 0.2s ease",
+            }}
+          >
+            Open Dashboard
+          </button>
+        </form>
+      </main>
+    </div>
+  );
+}
+
+function DashboardContent() {
   const { feeds, latest, status, error, lastFetched, anomalies, refetch } = useThingSpeak();
   const [dismissed, setDismissed] = useState(false);
   const prevAnomalyKey = useRef("");
@@ -355,13 +813,15 @@ export default function IotDashboard() {
     }
   }, [anomalyKey]);
 
-  const shockAnomaly = latest?.productState === "MAJOR_IMPACT" || latest?.productState === "FREE_FALL";
+  const shockAnomaly = latest?.productState === "MAJOR_IMPACT" || latest?.productState === "FREE_FALL" ||
+    latest?.transportState === "IMPACT_EVENT" || (latest?.shock != null && latest.shock >= 2.5);
 
   const chartData = feeds.map((f) => ({
     time: f.time,
     temperature: f.temperature,
     shock: f.shock,
     humidity: f.humidity,
+    pressure: f.pressure,
   }));
 
   return (
@@ -437,8 +897,8 @@ export default function IotDashboard() {
           </div>
           <button onClick={refetch} className="refresh-btn">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-              <path d="M3 3v5h5"/>
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
             </svg>
             Refresh Now
           </button>
@@ -471,16 +931,16 @@ export default function IotDashboard() {
             label="Humidity"
             value={latest?.humidity}
             unit="%"
-            anomaly={false}
+            anomaly={latest?.humAnomaly}
             sublabel="Relative humidity"
           />
           <MetricCard
-            icon="🧠"
-            label="Transport State"
-            value={latest?.transportState === "null" ? "UNKNOWN" : (latest?.transportState ?? "UNKNOWN")}
-            unit=""
-            anomaly={latest?.transportState === "IMPACT_EVENT" || latest?.transportState === "ENV_ALERT" || shockAnomaly}
-            sublabel="Contextual state"
+            icon="P"
+            label="Pressure"
+            value={latest?.pressure}
+            unit="hPa"
+            anomaly={latest?.pressAnomaly}
+            sublabel="Atmospheric pressure"
           />
           <div style={{ background: "#ffffff", border: "1px solid rgba(15,23,42,0.08)", borderRadius: 24, padding: "1.4rem 1.25rem", display: "flex", flexDirection: "column", gap: 10, boxShadow: "0 12px 24px rgba(15,23,42,0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -492,6 +952,10 @@ export default function IotDashboard() {
             </div>
             <span style={{ fontSize: 12, color: "#94a3b8" }}>Only accepts RFID tag scans</span>
           </div>
+        </section>
+
+        <section>
+          <LocationMap latitude={latest?.latitude} longitude={latest?.longitude} />
         </section>
 
         <section style={{ display: "grid", gap: "1rem" }}>
@@ -596,4 +1060,12 @@ export default function IotDashboard() {
       </main>
     </div>
   );
+}
+
+export default function IotDashboard() {
+  const [authenticated, setAuthenticated] = useState(false);
+
+  return authenticated
+    ? <DashboardContent />
+    : <LoginPage onLogin={() => setAuthenticated(true)} />;
 }

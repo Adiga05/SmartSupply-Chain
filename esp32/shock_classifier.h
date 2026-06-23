@@ -4,16 +4,20 @@
 // ============================================================
 //  Accelerometer-Based Shock & Impact Classifier
 //
-//  Collects accelerometer samples into a 1-second sliding
-//  window, extracts time-domain features (RMS, peak-to-peak,
-//  kurtosis, zero-crossing rate), and classifies the current
-//  motion pattern into one of 6 categories.
+//  Uses a DUAL detection strategy:
+//    1. INSTANTANEOUS: Every incoming sample is checked against
+//       impact thresholds in addSample(). Even a single 20ms
+//       spike above the G-force threshold immediately latches
+//       an impact event — no waiting for the 1-second window.
+//    2. WINDOW-BASED: Every 1 second, statistical features
+//       (RMS, kurtosis, ZCR, etc.) are extracted from the
+//       sliding window for vibration/tilt/free-fall detection.
 //
 //  Classification is rule-based with tuned thresholds — no ML
 //  framework required. Can be replaced with a TFLite model
 //  later (Tier 4) using the same feature vector.
 //
-//  Memory: ~616 bytes (50×3 floats buffer + features struct)
+//  Memory: ~620 bytes (50×3 floats buffer + features + peaks)
 // ============================================================
 
 #include <math.h>
@@ -55,6 +59,15 @@ struct ShockClassifier {
     ShockClass   lastClass;
     AccelFeatures lastFeatures;
 
+    // --- Instantaneous Peak Detector (latched between classify calls) ---
+    float  instantPeakG;           // Highest G-force seen since last classify()
+    ShockClass instantLatchedClass; // Highest-severity class from peak detection
+    int    instantImpactCount;     // Number of samples that exceeded minor bump threshold
+    int    majorImpactCount;       // Number of samples that exceeded major impact threshold
+    int    minorBumpCount;         // Number of samples that exceeded minor bump threshold
+    bool   permanentMajorImpact;   // Latches major impact if detected >2 times
+    bool   permanentMinorBump;     // Latches minor bump if detected >2 times
+
     // -------------------------------------------------------
     //  Initialize. Call once in setup().
     // -------------------------------------------------------
@@ -62,6 +75,13 @@ struct ShockClassifier {
         bufferIndex = 0;
         bufferFull  = false;
         lastClass   = SHOCK_NORMAL;
+        instantPeakG = 0.0f;
+        instantLatchedClass = SHOCK_NORMAL;
+        instantImpactCount = 0;
+        majorImpactCount = 0;
+        minorBumpCount = 0;
+        permanentMajorImpact = false;
+        permanentMinorBump = false;
         memset(bufferX, 0, sizeof(bufferX));
         memset(bufferY, 0, sizeof(bufferY));
         memset(bufferZ, 0, sizeof(bufferZ));
@@ -71,6 +91,11 @@ struct ShockClassifier {
     // -------------------------------------------------------
     //  Add a new accelerometer sample (in G units).
     //  Call at 50Hz (every 20ms) from the main loop.
+    //
+    //  INSTANT DETECTION: Every sample is checked against
+    //  thresholds immediately. If even ONE sample exceeds
+    //  the major/minor impact threshold, it latches the
+    //  event so classify() will report it.
     // -------------------------------------------------------
     void addSample(float x, float y, float z) {
         bufferX[bufferIndex] = x;
@@ -80,6 +105,25 @@ struct ShockClassifier {
         if (bufferIndex >= ACCEL_WINDOW_SIZE) {
             bufferIndex = 0;
             bufferFull = true;
+        }
+
+        // --- Instantaneous peak detection (runs every 20ms) ---
+        float mag = sqrtf(x * x + y * y + z * z);
+
+        // Track the highest G seen in this classify interval
+        if (mag > instantPeakG) {
+            instantPeakG = mag;
+        }
+
+        // Latch impact class immediately — highest severity wins
+        if (mag > THRESHOLD_MAJOR_IMPACT) {
+            instantLatchedClass = SHOCK_MAJOR_IMPACT;
+            instantImpactCount++;
+            majorImpactCount++;
+        } else if (mag > THRESHOLD_MINOR_BUMP && instantLatchedClass != SHOCK_MAJOR_IMPACT) {
+            instantLatchedClass = SHOCK_MINOR_BUMP;
+            instantImpactCount++;
+            minorBumpCount++;
         }
     }
 
@@ -183,17 +227,72 @@ struct ShockClassifier {
 
     // -------------------------------------------------------
     //  Classify the current motion pattern.
-    //  Priority-ordered: most dangerous events checked first.
+    //  DUAL STRATEGY:
+    //    - First checks instantaneous latched peaks (catches
+    //      brief spikes that last only 1-2 samples / 20-40ms)
+    //    - Then falls through to window-based feature analysis
+    //      for vibration, tilt, and free-fall patterns.
     //  Call every ~1 second after the window is populated.
     // -------------------------------------------------------
     ShockClass classify() {
+        // Permanent latch: once triggered, always report this class
+        if (permanentMajorImpact) {
+            lastClass = SHOCK_MAJOR_IMPACT;
+            return SHOCK_MAJOR_IMPACT;
+        }
+        if (permanentMinorBump) {
+            lastClass = SHOCK_MINOR_BUMP;
+            return SHOCK_MINOR_BUMP;
+        }
+
         // Need minimum data to classify
         if (!bufferFull && bufferIndex < 10) {
+            // Still check instant peaks even with sparse data
+            if (instantLatchedClass != SHOCK_NORMAL) {
+                lastClass = instantLatchedClass;
+                if (instantLatchedClass == SHOCK_MAJOR_IMPACT && majorImpactCount > 2) {
+                    permanentMajorImpact = true;
+                }
+                if (instantLatchedClass == SHOCK_MINOR_BUMP && minorBumpCount > 2) {
+                    permanentMinorBump = true;
+                }
+                resetInstantPeaks();
+                return lastClass;
+            }
             lastClass = SHOCK_NORMAL;
             return SHOCK_NORMAL;
         }
 
         AccelFeatures f = extractFeatures();
+
+        // --- Priority 0: Instantaneous latched impact events ---
+        //     These were detected in real-time by addSample().
+        //     Even a single sample spike is caught here.
+        if (instantLatchedClass == SHOCK_MAJOR_IMPACT) {
+            // Override window maxMagnitude with the actual instant peak
+            // (the window average may have diluted it)
+            f.maxMagnitude = instantPeakG;
+            lastFeatures = f;
+            if (majorImpactCount > 2) {
+                permanentMajorImpact = true;
+            }
+            lastClass = SHOCK_MAJOR_IMPACT;
+            resetInstantPeaks();
+            return SHOCK_MAJOR_IMPACT;
+        }
+        if (instantLatchedClass == SHOCK_MINOR_BUMP) {
+            f.maxMagnitude = instantPeakG;
+            lastFeatures = f;
+            if (minorBumpCount > 2) {
+                permanentMinorBump = true;
+            }
+            lastClass = SHOCK_MINOR_BUMP;
+            resetInstantPeaks();
+            return SHOCK_MINOR_BUMP;
+        }
+
+        // Reset instant peaks — no impact was latched this cycle
+        resetInstantPeaks();
 
         // --- Priority 1: Free-fall (most urgent — package is falling!) ---
         if (f.freeFallCount >= FREE_FALL_MIN_SAMPLES) {
@@ -201,15 +300,16 @@ struct ShockClassifier {
             return SHOCK_FREE_FALL;
         }
 
-        // --- Priority 2: Major impact (severe damage risk) ---
+        // --- Priority 2: Major impact from window analysis ---
         if (f.maxMagnitude > THRESHOLD_MAJOR_IMPACT) {
             lastClass = SHOCK_MAJOR_IMPACT;
             return SHOCK_MAJOR_IMPACT;
         }
 
-        // --- Priority 3: Minor bump (impulsive jolt, moderate G) ---
-        if (f.maxMagnitude > THRESHOLD_MINOR_BUMP &&
-            f.kurtosis > THRESHOLD_BUMP_KURTOSIS) {
+        // --- Priority 3: Minor bump (peak G exceeds threshold) ---
+        //     No kurtosis requirement — a single sharp jolt
+        //     won't produce high kurtosis in a 50-sample window.
+        if (f.maxMagnitude > THRESHOLD_MINOR_BUMP) {
             lastClass = SHOCK_MINOR_BUMP;
             return SHOCK_MINOR_BUMP;
         }
@@ -230,6 +330,17 @@ struct ShockClassifier {
         // --- Default: Normal ---
         lastClass = SHOCK_NORMAL;
         return SHOCK_NORMAL;
+    }
+
+    // -------------------------------------------------------
+    //  Reset instantaneous peak tracking for the next cycle.
+    // -------------------------------------------------------
+    void resetInstantPeaks() {
+        instantPeakG = 0.0f;
+        instantLatchedClass = SHOCK_NORMAL;
+        instantImpactCount = 0;
+        majorImpactCount = 0;
+        minorBumpCount = 0;
     }
 
     // -------------------------------------------------------
